@@ -2,13 +2,9 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
+	"encoding/base64"
 	"fmt"
-	"fyne.io/fyne"
-	"fyne.io/fyne/app"
-	"fyne.io/fyne/dialog"
-	"fyne.io/fyne/layout"
-	"fyne.io/fyne/widget"
-	"github.com/cavaliercoder/grab"
 	"io"
 	"io/ioutil"
 	"os"
@@ -17,31 +13,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
+
+	"fyne.io/fyne"
+	"fyne.io/fyne/app"
+	"fyne.io/fyne/dialog"
+	"fyne.io/fyne/layout"
+	"fyne.io/fyne/widget"
 )
 
-// Application name
-// (preferably without spaces as this will be used in install path)
-const appName = "APP_NAME"
-
-// Base URL for downloaded files
-// (%s gets replaced by current platform, windows/linux/darwin)
-const baseUrl = "https://example.com/"
-
-// All files to download
-// Only files ending with .zip are extracted
-// First file *must* be executable and second *must* be icon
-var files = []string{
-	"%s",
-	"icon.png",
-	"%s-data.zip",
-}
-
-// Install self as "updater"
-const installSelf = true
-
-// goInstaller version
-const version = "v1.1"
+const appName = "OpenRQ"
 
 // Gets the username of the current user
 // TODO: Cache this as username probably doesn't change during execution
@@ -103,73 +83,13 @@ func GetFileFromPath(path string) string {
 	return path[lastIndex:]
 }
 
-// Starts download and updates progress bar 0-50
-func Download(progress *widget.ProgressBar, status *widget.Label) error {
-	// Create HTTP client
-	client := grab.NewClient()
-	// Create a new request for each file to download
-	for i := 0; i < len(files); {
-		// Get file we're downloading
-		file := baseUrl
-		// Check if we need the os
-		if strings.Contains(files[i], "%s") {
-			file += fmt.Sprintf(files[i], runtime.GOOS)
-		} else {
-			file += files[i]
-		}
-		fileName := GetFileFromPath(file)
-		fmt.Println("Download:\t", file)
-		status.SetText(fmt.Sprintf("[%d/%d] Downloading %s...", i + 1, len(files), fileName))
-		// Create request
-		request, err := grab.NewRequest(GetTempPath() + fileName, file)
-		if err != nil {
-			return err
-		}
-		// Get response
-		response := client.Do(request)
-
-		// Create ticker
-		ticker := time.NewTicker(time.Millisecond)
-
-		// Create variable for when to run loop
-		run := true
-		for run {
-			select {
-			// Check for progress
-			case <-ticker.C:
-				progress.SetValue(response.Progress())
-			// Check if we're done
-			case <-response.Done:
-				if err := response.Err(); err != nil {
-					// Something went wrong, stop ticker and return error
-					ticker.Stop()
-					return err
-				}
-				// File downloaded, stop ticker and go to next file
-				ticker.Stop()
-				run = false
-			}
-		}
-
-		i++
-	}
-
-	return nil
-}
-
 // Attempts to extract input zip file to output destination
-func Extract(input, output string, progress *widget.ProgressBar) error {
+func Extract(input []byte, output string, progress *widget.ProgressBar) error {
 	// Try to open file
-	reader, err := zip.OpenReader(input)
+	reader, err := zip.NewReader(bytes.NewReader(input), int64(len(input)))
 	if err != nil {
 		return err
 	}
-	// Close reader when we're done
-	defer func() {
-		if err := reader.Close(); err != nil {
-			panic(err)
-		}
-	}()
 	// Helper function to extract each file in a zip
 	extractAndWrite := func(file *zip.File) error {
 		// Open file for reading
@@ -190,14 +110,14 @@ func Extract(input, output string, progress *widget.ProgressBar) error {
 			if err := os.MkdirAll(path, file.Mode()); err != nil {
 				return err
 			}
-		// If it's a file, actually extract it
+			// If it's a file, actually extract it
 		} else {
 			// Create directory for file if needed
 			if err := os.MkdirAll(filepath.Dir(path), file.Mode()); err != nil {
 				return err
 			}
 			// Create output file
-			outFile, err := os.OpenFile(path, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, file.Mode())
+			outFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
 			if err != nil {
 				return err
 			}
@@ -221,7 +141,7 @@ func Extract(input, output string, progress *widget.ProgressBar) error {
 		// Get current file
 		file := reader.File[i]
 		// Update progress
-		progress.SetValue(float64(i + 1) / float64(len(reader.File)))
+		progress.SetValue(float64(i+1) / float64(len(reader.File)))
 		// Attempt to extract file
 		err := extractAndWrite(file)
 		if err != nil {
@@ -286,69 +206,14 @@ func Install(progress *widget.ProgressBar, status *widget.Label) error {
 	if err := os.MkdirAll(GetInstallPath(), 0700); err != nil {
 		return err
 	}
-	// Loop over all files hopefully downloaded
-	for i, currentFile := range files {
-		// Get file we're installing
-		file := GetTempPath()
-		// Check if we need os
-		if strings.Contains(currentFile, "%s") {
-			file += fmt.Sprintf(currentFile, runtime.GOOS)
-		} else {
-			file += currentFile
-		}
-		fileName := GetFileFromPath(file)
-		fmt.Println("Install:\t", file)
-		status.SetText(fmt.Sprintf("[%d/%d] Installing %s...", i+1, len(files), fileName))
-		if strings.HasSuffix(fileName, ".zip") {
-			// It's a zip file, extract it first
-			if err := Extract(file, GetInstallPath(), progress); err != nil {
-				return err
-			}
-			// Delete file after extracting
-			if err := os.Remove(file); err != nil {
-				return err
-			}
-		} else {
-			// If executable, rename to project name first
-			execName := fileName
-			if i == 0 {
-				execName = GetExecutableName()
-				// Make file executable on linux/darwin
-				if runtime.GOOS != "windows" {
-					cmd := exec.Command("chmod", "+x", file)
-					if err := cmd.Start(); err != nil {
-						return err
-					} else if err := cmd.Wait(); err != nil {
-						return err
-					}
-				}
-			}
-			// Any other file, just move it
-			if err := os.Rename(file, GetInstallPath() + execName); err != nil {
-				return err
-			}
-		}
+
+	data, err := base64.StdEncoding.DecodeString(appData)
+	if err != nil {
+		return err
 	}
-	// Install installer as updater if set
-	if installSelf {
-		// Get what the final file name should be
-		fileName := "updater"
-		if runtime.GOOS == "windows" {
-			fileName += ".exe"
-		}
-		// Get the from/to paths
-		from := os.Args[0]
-		to := GetInstallPath() + fileName
-		// Check if we're trying to copy to ourselves
-		if from != to {
-			// Copy to the right directory
-			if err := Copy(from, to); err != nil {
-				return err
-			}
-		}
-	}
-	// Everything is fine
-	return nil
+
+	status.SetText(fmt.Sprintf("Installing..."))
+	return Extract(data, GetInstallPath(), progress)
 }
 
 func GetShortcutLocation() string {
@@ -374,18 +239,18 @@ func CreateShortcut() error {
 		// Create initial shortcut text
 		// (this icon doesn't contain os)
 		content := fmt.Sprintf("[Desktop Entry]\nName=%s\nType=Application\nTerminal=false\nExec=%s\nIcon=%s",
-			appName, GetInstallPath() + appName,
-			fmt.Sprintf("%s%s", GetInstallPath(), files[1]))
+			appName, GetInstallPath()+appName,
+			fmt.Sprintf("%s%s", GetInstallPath(), appName))
 		// Try to write to file
 		if err := ioutil.WriteFile(GetShortcutLocation(), []byte(content), 0700); err != nil {
 			return err
 		}
-	// windows uses annoying binary lnk files
+		// windows uses annoying binary lnk files
 	} else if runtime.GOOS == "windows" {
 		// We need to create a temporary Visual Basic file and then execute it
 		target := GetInstallPath() + GetExecutableName()
-		icon   := GetInstallPath() + files[1]
-		vbs := fmt.Sprintf("Set link = WScript.CreateObject(\"WScript.Shell\").CreateShortcut(\"%s\")\n" +
+		icon := GetInstallPath() + appName
+		vbs := fmt.Sprintf("Set link = WScript.CreateObject(\"WScript.Shell\").CreateShortcut(\"%s\")\n"+
 			"link.TargetPath = \"%s\"\nlink.IconLocation = \"%s\"\nlink.Description = \"%s\"\nlink.Save",
 			GetShortcutLocation(), target, icon, appName)
 		// Write vbs to file
@@ -462,7 +327,7 @@ func GetButtonContainer(installTapped func(), uninstallTapped func()) *fyne.Cont
 	}
 	// App is not installed, return uninstall and update buttons
 	var buttons []*widget.Button
-	buttons = []*widget.Button {
+	buttons = []*widget.Button{
 		widget.NewButton("Uninstall", func() {
 			go func() {
 				// Disable buttons
@@ -506,11 +371,7 @@ func GetLayout(parent fyne.Window) fyne.CanvasObject {
 			// Install/Update
 			progress.SetValue(0)
 			// Attempt download
-			if err := Download(progress, status); err != nil  {
-				dialog.ShowError(err, parent)
-				status.SetText("Download failed")
-			// Attempt install
-			} else if err := Install(progress, status); err != nil {
+			if err := Install(progress, status); err != nil {
 				dialog.ShowError(err, parent)
 				status.SetText("Install failed")
 				// Attempt to create shortcut
@@ -557,9 +418,7 @@ func main() {
 			fyne.NewMenuItem("About", func() {
 				dialog.ShowInformation(
 					"About",
-					fmt.Sprintf(
-						"goInstaller %s\nhttps://github.com/kraxarn/goInstaller\nLicensed under BSD-3",
-						version), window)
+					fmt.Sprintf("OpenRQinstaller based of goInstaller v1.1\nhttps://github.com/kraxarn/goInstaller\nLicensed under BSD-3"), window)
 			}),
 			fyne.NewMenuItem("Licenses", func() {
 				// Check if we already have a license window open
@@ -568,7 +427,7 @@ func main() {
 				}
 				// Create window with content and reset on close
 				licenseWindow = fyne.CurrentApp().NewWindow("Licenses")
-				licenseWindow.Resize(fyne.Size{Width: 0, Height: 800})
+				licenseWindow.Resize(fyne.Size{Width: 600, Height: 800})
 				licenseWindow.CenterOnScreen()
 				licenseWindow.SetPadded(true)
 				licenseWindow.SetContent(widget.NewScrollContainer(widget.NewLabel(licenses)))
